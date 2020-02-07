@@ -1,0 +1,528 @@
+---
+title: "Accident! Analysis of New Zealand accident data with Poisson models"
+#subtitle: "ST_518 OSU"
+author: "Christopher Odell"
+output:
+  word_document: default
+  html_notebook: default
+  html_document:
+    df_print: paged
+---
+
+
+```{r echo = FALSE, message = FALSE, warning = FALSE, print = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(vcdExtra)
+library(magrittr)
+library(gridExtra)
+library(pscl)
+library(MASS)
+library(lme4)     # access the mixed functions
+library(VGAM)     # contains crash data
+library(tree)     # for classification trees
+library(pROC)     # ROC curves   
+library(boot)     # contains the cv.glm function
+library(ggpubr)
+#install.packages("ggpubr")
+
+```
+
+
+###Introduction
+
+An understanding of road safety is critical for transportation officials and is also of interest to the general public. Two common modes of transportation are cars and motorcycles. Drivers may be interested to know whether being involved in a car accident with injuries would have a high chance of fatality. Motorcycle riders might want to know if weekends are safer for them to ride over weekdays with the commuter traffic. The purpose of this study is to analyze data on car and motorcycle accidents in New Zealand to answer the following two questions:
+
+*Objective 1* - Is there a statistical difference in New Zealand reported car accidents with injuries vs accidents with fatalities by day of week or time of day?
+
+*Objective 2* - Is a motorcyclist more likely to get in a reported accident on the weekday or the weekend in New Zealand?
+
+To answer these questions, I performed a simple exploratory analysis, and developed hypotheses. With the hypothesis in mind, I selected my primary model and fit multiple models to compare against. Next, I fit the residuals and made conclusions about the objectives of interest. 
+
+
+### Data Description
+
+The data was collected by the New Zealand Ministry of Transport and was reported in 2010 for car accidents of various sorts in the year 2009. The data was broken down into eight tables and distributed in a library within R. In this study I analyzed the tables for car crashes with injuries, car crashes with fatalities (not included in injuries), and crashes that involved motorcycles. The data was formatted as contingency tables and was broken down by day of week and hour of the day. For both objectives, I transformed the data from multiple cross tabs to a single tidy tabular dataset. I grouped the day of the week between weekdays (Monday through Friday) and weekends (Saturday and Sunday), based on the assumption that traffic patterns on weekdays would be closer in similarity to each other than weekends. Additionally, I grouped the hours of the day into four periods: "early morning" (12am to 6am), "morning" (6am to 12pm), "afternoon" (12pm to 7pm), and "evening" (7pm to 12am).
+
+From there I subsetted the data into two data frames, one being car accidents and the other being motorcycle accidents. Within the car accident dataframe I added a column to classify car accidents with fatalities versus car accidents with only injuries as a binary (1,0) variable. In the motorcycle dataframe, I performed a similar addition to classify motorcycle accidents with injuries on weekdays versus weekends into a binary (1,0) variable.
+ 
+
+
+
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, print = FALSE, results='hide'}
+
+hour <- rownames(crashi) ## grab the hours
+crashi2 <- stack(crashi) ## combine 7 columns of crashes into 1
+names(crashi2) <- c("Count","Day")
+crashi2$Day <- factor(crashi2$Day,levels(crashi2$Day)[c(2,6,7,5,1,3,4)])  # make sure the days are ordered correctly
+crashi2$Hour <- as.numeric(rep(hour, ncol(crashi)))  #add a column with hour and make it numeric (not categorical)
+crashi2$datatype <- "car"
+
+#Repeat for Fatal not included in other crash data
+crashf2 <- stack(crashf)
+names(crashf2) <- c("Count","Day")
+crashf2$Day <- factor(crashf2$Day,levels(crashf2$Day)[c(2,6,7,5,1,3,4)])
+crashf2$Hour <- as.numeric(rep(hour, ncol(crashf)))
+crashf2$datatype <- "carf"
+
+#Repeat for Trucks
+crashtr2 <- stack(crashtr)
+names(crashtr2) <- c("Count","Day")
+crashtr2$Day <- factor(crashtr2$Day,levels(crashtr2$Day)[c(2,6,7,5,1,3,4)])
+crashtr2$Hour <- as.numeric(rep(hour, ncol(crashtr)))
+crashtr2$datatype <- "Trucks"
+
+#Repeat for Motorcycle
+crashmc2 <- stack(crashmc)
+names(crashmc2) <- c("Count","Day")
+crashmc2$Day <- factor(crashmc2$Day,levels(crashmc2$Day)[c(2,6,7,5,1,3,4)])
+crashmc2$Hour <- as.numeric(rep(hour, ncol(crashmc)))
+crashmc2$datatype <- "motorcycle"
+
+crash <- rbind(crashi2,crashf2,crashtr2,crashmc2)
+crash %<>% mutate(Vehicle = ifelse(datatype == "car" | datatype == "carf", "car", datatype),
+                  DOW = ifelse(Day != "Sat" & Day != "Sun", "Weekday", "Weekend"), Day = as.character(Day),  Time.Cat = cut(Hour,
+	breaks = c(-1, 5.5, 11.5, 18.5, 25),
+	labels = c("Early.Morn", "Morn", "Afternoon", "Evening")))
+
+names(crash) <- c("Freq", "Day", "Hour", "datatype", "vehicle", "DOW","TOD")
+head(crash)
+summary(crash)
+count(crash %>% subset(Freq == 0))/count(crash %>% subset(Freq != 0))
+
+```
+
+
+### Statistical Models:
+
+Observing that it was count data, I decided I would proceed with a type of Poisson model. I did this knowing that the normal assumption in a Poisson model the mean is equal to the variance, and it is likely I would have to account for some type of overdispersion. I also had thought that there might be "true" zeros in the data represented by times when drivers were not involved in a car accident. With a high count of zeros and the assumption that these zeros are greater than what the negative binomial model could capture, I went with a zero Inflated model as my initial fit for both objective 1 and objective 2. To confirm this selection, I checked my initial model against the negative binomial model as part of my model diagnosis. I assumed that the overdispersion of the data could be sufficiently handled by the zero inflated model for both objectives.
+
+The Poisson model is broken down into two parts: The first part is the logit() which is a binary distribution that generates extra zeros. The second part is the log() which is a Poisson distribution that generates the counts, which could contain zeros. The equation for the zero inflated Poisson model is:
+
+
+$NFreq_{i,j} \sim Poisson(\mu_{i,j})$
+
+$E(Freq_{i,j}) = \mu_{i,j}$
+
+$Pr(Y = y;\lambda,\pi)=$
+
+
+$=\pi + (1-\pi)e^-\lambda : y=0$
+
+$=(1-\pi)\frac{\lambda^ye^{-\lambda}}{y!} : y>=1,2,3,...$
+
+$\sim N(0, \sigma^2)$
+
+
+where the outcome variable $y_j$ has any non-negative integer value (y = observed count), $\lambda_i$ is the expected Poisson count (expected count and variance) for the $i^{th}$ observation; $\pi$ is the probability of extra zeros. The $\pi_i\in[0,1]$ are probabilities and the $\lambda_i>0$ are the Poisson rate parameters.
+
+
+```{r echo = FALSE, message = FALSE, warning = FALSE, print = FALSE}
+
+#Subset the data down to the just observations that have car accidents
+objOne <- crash %>% mutate(.,"injury" = ifelse((datatype == "car"),0,1)) %>% subset(vehicle == "car")
+
+# Start off with just a little exploratory plot to get an idea of distribution or issues
+
+p <- ggplot(objOne, aes(Freq))+ theme(plot.title = element_text("Accident vs Occurance")) +
+  geom_histogram(binwidth = 1)+xlab("Number of Accidents")+ylab("Occurances") # Here we see some zero inflated concerns
+
+p.title = element_text(size=5)
+
+p1 <- ggplot(objOne, aes(TOD, Hour))+
+  geom_point()+ylab("Time of Day") # Here there are some correlation concerns with the new data points
+
+p2 <- ggplot(objOne, aes(Hour, Freq))+
+  geom_point() +ylab("Occurances")
+
+p3 <- ggplot(objOne, aes(TOD, Freq))+
+  geom_boxplot() +xlab("Time of Day")+ylab("Occurances")
+
+p4 <- ggplot(objOne, aes(DOW, Freq))+
+  geom_boxplot() +xlab("Day of Week")+ylab("Occurances")
+
+```
+
+
+### Objective 1
+
+The first objective was to determine whether there was a difference between car accidents with injuries and car accidents with fatalities by day of week or time of day. I began by performing a simple exploratory analysis to ensure some of my original assumptions were met, and that the data was complete. I took appropriate caution to ensure data snooping did not occur. Some of the exploratory plots are presented in Figure 1.
+
+
+```{r echo = FALSE, message = FALSE, warning = FALSE, print = FALSE, results='hide'}
+
+figure <- ggarrange(p, p2, p3, p4,ncol = 2, nrow = 2, labels = c("Plot 1","Plot 2","Plot 3","Plot 4"),
+          font.label = list(size = 8, color = "blue"), vjust = .90,hjust = -2)
+
+annotate_figure(figure,
+               top = text_grob("Car Accident Variables", color = "black", face = "bold", size = 10),
+               bottom = text_grob("Data source: Minister of Transportion", color = "black",
+                                  hjust = 1, x = 1, face = "italic", size = 7),
+               fig.lab = "Figure 1", fig.lab.face = "bold"
+)
+
+```
+
+The distribution shown in Figure 1 (Plots 1 and 2) confirmed that a Poisson model was suitable. A plot of number of accidents vs occurrence (Plot 1) showed that the data had a Poisson distribution with a right skew.
+
+A plot of occurrences by hour (Plot 2) showed that there was a curvature in hour of the day, which is unsurprising due to working hours. One option for dealing with this is to perform a squared value. However, since hours are distinct variables it did not make sense to use that approach because I was dealing with count data that is a repetitive cycle. This repetitive cycle could have been seen as a sine function if I had unaggregated the data. Instead, I determined that the best approach was to use distinct grouping of times of the day. The groupings are shown in plots Plot 3 and Plot 4.
+
+I hypothesized that there was no difference between car accidents with injuries versus car accidents with fatalities by day of week or time of day. The alternative hypothesis was that there was a difference between car accidents with injuries versus car accidents with fatalities by day of week or time of day. The zero inflated model chosen had a response of frequency, with explanatory terms of accidents (injury), day of week (DOW), time of day (TOD) and an interaction between time of day and day of week. I used an interaction term since day of week and time of day have commonality. I made the assumption that one of these variables would have a causal effect on the other. The hypothesis and model are represented by the equations below. 
+
+*Hypothesis*: 
+$H_0$ : $\mu$ car accidents with injuries = $\mu$ car accidents with fatalities
+
+$H_A$ : $\mu$ car accidents with injuries $\neq$ $\mu$ car accidents with fatalities
+
+
+$Y_i \overset{ind}{\sim} ZIP(\pi_i, \lambda_i)$
+
+  $logit(\pi_i) = \beta_0+ \beta_1 X_{injury} + \beta_2 X_{DOW} + \beta_3 X_{TOD} + \beta_4 X_{TOD} + \beta_5 X_{TOD} + \beta_6 X_{DOW * TOW} + \beta_7 X_{DOW * TOW} + \beta_7 X_{DOW * TOW}$
+
+and 
+
+  $log(\lambda_i) = \gamma_0 + \gamma_1 X_{fatality} + \gamma_2 X_{DOW} + \gamma_3 X_{TOD} + \gamma_4 X_{TOD} + \gamma_5 X_{TOD} + \gamma_6 X_{DOW * TOW} + \gamma_7 X_{DOW * TOW} + \gamma_7 X_{DOW * TOW}$
+
+
+with $\beta$ representing the coefficients for the count (logit) function, $\gamma$ representing the coefficients of the Poisson (log) function. The $X_{injury}$ is 0 if injury and 1 if fatality, $X_{DOW}$ is 0 if weekday and 1 if weekend, $X_{TOD} = X_3, X_4, X_5$ is 0 1 if morning, afternoon or evening respectively and 0 otherwise, and $X_6$,$X_7$,$X_8$ represent the interaction terms of the model. Noting that for categorical variables, k-1 indicator variables are required for each of the explanatory variables, where k is the number of categories in that explanatory variable, this explains why I have more indicator variables than column variables.
+
+
+
+###Statistical Modeling:
+
+When I ran the zero-inflated model I got an error as seen below due to the separation of the data between car accidents with injuries versus car accidents with fatalities.
+```{r echo= FALSE, results='hide'}
+
+mod1 <- zeroinfl(Freq ~ injury + TOD * DOW, data = objOne, 
+	dist = "poisson")
+summary(mod1)
+
+```
+This indicates that there are a large number of zeros with a small number of values greater than zero in only one of the data sets. Approximately 10% of the 336 observations have a count of zero which all came from the fatalities data set. I had some options to address this issue, which were to use a conditional mixed effect model, drop one of the variables, or proceed with a generalized linear model. A conditional mixed effects model would limit inference while dropping one of the variables for DOW or TOD to find a less interactive model would have been possible, but I was concerned that important information would be lost. My thought was that the combination of the DOW and TOD could have causal effects on the risk on type of accident. So, I determined to proceed as planned. 
+
+
+Examination of the model summary for the zero-inflated model indicated that all coefficients were significant at the $\_alpha$=0.05 level on the count (logit) fit and no variables were significant on the Poisson distribution (log) fit. I then performed a model comparison with a number of other models to assess model fit. My model, the zero-inflated Poisson model, was assigned to mod1, the negative binomial Poisson model was assigned to mod2, and the generalized linear Poisson model was assigned to mod3, and so on.
+
+
+```{r echo=FALSE, message = FALSE, warning = FALSE, print = FALSE, results='hide'}
+
+percent_zero <- (nrow((subset(objOne, Freq == 0)))/nrow((subset(crash, vehicle == "car"))))
+
+count(objOne %>% subset(Freq == 0))/count(objOne %>% subset(Freq != 0))
+count(objOne %>% subset(Freq == 0))
+
+round(prop.table(xtabs(Freq ~ TOD + DOW + datatype, objOne)),3)
+
+```
+
+```{r echo=FALSE, warning=FALSE, results='hide'}
+
+mod2 <- glm.nb(Freq ~ datatype + TOD * DOW, data = objOne)
+
+mod3 <- glm(Freq ~ datatype + TOD * DOW, data = objOne, family = "poisson")
+
+LRstats(mod1, mod2, mod3)
+
+vuong(mod2, mod3)
+vuong(mod2, mod1)
+
+```
+
+
+The generalized linear model (mod3) and the original zero-inflated model (mod1) both resulted in a higher `AIC` score compared to the negative binomial generalized model (mod2) for the likelihood summary test. Since the zero-inflated Poisson model and the usual negative binomial generalized model do not nest, I could not use the standard drop in deviance test for comparison, and therefore proceeded with a Vuong test. The test confirmed that the negative binomial model was a more suitable fit than either the zero-inflated model or the generalized linear model with a p-value <= 0.005 at the $\alpha$=0.05 level in both tests. Therefore, I proceeded forward with the negative binomial model (mod2). The model summary output is below: 
+
+
+```{r echo = FALSE}
+
+summary(mod2)
+
+```
+
+Looking at the summary output for mod2, I noticed that the $\theta$ was almost 10 indicating overdispersion existed. The model summary also showed that all explanatory variables were significant at the $\alpha$=0.05 level with all p-values < 0.0002. Next, I needed to check the residuals for mod2 to ensure that the model fit was sufficient enough to make inference. The residuals are shown below in Figure 2.
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE, print=FALSE, results='hold'}
+
+objOne$fits <- predict.glm(mod2,objOne,type="response")
+ggplot(data = objOne, aes(x = TOD, y = Freq, group = DOW)) +
+	geom_point(aes(colour = DOW)) +
+	geom_line(aes(TOD,fits,color=DOW))
+
+```
+
+```{r echo = FALSE, message = FALSE, warning = FALSE, print = FALSE}
+
+objOne$residuals_deviance <- residuals(mod2)
+objOne$residuals_pearson <- residuals(mod2, type = "pearson")
+r <- ggplot(data = objOne, aes(Hour,residuals_deviance)) + geom_point() + ggtitle("Deviance Residual")+
+  theme(plot.title = element_text(hjust = 0.5))
+r1 <- ggplot(data = objOne, aes(Hour,residuals_pearson)) + geom_point() + ggtitle("Pearson Residual")+
+  theme(plot.title = element_text(hjust = 0.5))
+r2 <- ggplot(data = objOne, aes(residuals_deviance,residuals_pearson)) + geom_point() +ggtitle("Deviance vs Pearson")+ theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r echo = FALSE , fig.height=4, fig.width=6}
+figure <- ggarrange(r, r1, r2,ncol = 2, nrow = 2, labels = c("Plot 1","Plot 2","Plot 3"),
+          font.label = list(size = 10, color = "blue"), vjust = 1,hjust = -.25)
+
+annotate_figure(figure,
+               top = text_grob("Model Fit Residual Evaluation", color = "black", face = "bold", size = 14),
+               fig.lab = "Figure 2", fig.lab.face = "bold"
+)
+
+```
+
+As shown in Figure 2 Plots 1 and 2 the residuals seemed to be fairly spread out with no clear pattern, indicating an appropriate fit. I also looked at the residuals against each other using the Pearson residuals and the Deviance residuals shown in Plot 3, which had a slight curve but not enough to be concerning. There were also two outliers in the upper right-hand side of the comparison plot. A further test of influence could be performed but I did not complete it as part of this analysis. 
+
+
+```{r echo = FALSE, Print = FALSE, results='hide'}
+MSPE <- (cv.glm(objOne, mod2, K = 5)$delta)
+MSPE
+
+```
+I also looked at Mean Squared Prediction Error (MSPE) for any indication of how the model could be used for prediction (lower MSPE is better). To obtain the MSPE, I used a 5-fold cross-validation method on the data from the mod2 model, resulting in an MSPE above 260 for both the adjusted and non-adjusted MSPE. This means that there was a good amount of variation between the model and the actual data. Ideally, I would use a training and test data set if I were trying to make a prediction but in this analysis that was not the objective. With this MSPE, the high $\theta$ noted earlier, and the interaction between time of day and day of the week it is important to be cautious about any inference conducted. There could potentially be a better model fit such as a mixed model which would give conditional inference.
+
+
+
+```{r echo = FALSE, message = FALSE, warning = FALSE, print = FALSE, results='hide'}
+
+exp(-3.43111)
+exp(-3.43111 + c(-1,1)*1.96*0.06657)
+```
+
+
+###Results Summary for Objective 1
+
+Based on the negative binomial model (mod2) there was strong evidence to reject the null hypothesis that car accidents with injuries is equal to car accidents with fatalities at ??=0.05 with a p-value <= 0.0001 from a Wald test. For two subjects with the same baseline measurements involved in a car accident, the model estimates a fatal accident would occur 3.2% as often as that of an accident with injuries. A 95% confidence interval for this multiplicative effect runs from 2.8% to 3.7%. This is based on accounting for all other baseline variables being the same (weekend, weekday, time of day and their interactions).
+
+
+
+### Objective 2
+
+The second objective was to determine whether there was a difference between motorcycle accidents with injuries on weekdays versus weekends. Again, I started with a simple exploratory analysis to ensure my assumptions were met. I still maintained caution to ensure data snooping did not exist; the challenge was that I had already run the analysis on similar data for Objective 1. With this in mind, I felt it still necessary to proceed with my original plan of using the zero-inflated model to help mitigate any bias. Some of the exploratory plots are presented in Figure 3 below:
+
+
+
+```{r echo = FALSE, message = FALSE, warning = FALSE, print = FALSE, results='hide'}
+
+
+objTwo <- crash %>% dplyr::filter(!grepl("carf", datatype) & grepl("motorcycle", datatype))
+
+#Subset the data down to the just observations that have car accidents
+objTwo <- crash %>% mutate(.,"DOWType" = ifelse((DOW == "Weekday"),0,1)) %>% subset(vehicle == "motorcycle")
+
+# Start off with just a little exploratory plot to get an idea of distribution or issues
+
+plot1 <- ggplot(objTwo, aes(Freq))+
+  geom_histogram(binwidth = 1)+xlab("Number of Accidents")+ylab("Occurances") # Here we see some zero inflated concerns
+
+plot2 <- ggplot(objTwo, aes(TOD, Hour))+
+  geom_point()+ylab("Time of Day") # Here there are some correlation concerns with the new data points
+
+plot3 <- ggplot(objTwo, aes(Hour, Freq))+
+  geom_point() +ylab("Occurances")
+
+plot4 <- ggplot(objTwo, aes(TOD, Freq))+
+  geom_boxplot() +xlab("Time of Day")+ylab("Occurances")
+
+plot5 <- ggplot(objTwo, aes(DOW, Freq))+
+  geom_boxplot() +xlab("Day of Week")+ylab("Occurances")
+
+
+figure <- ggarrange(plot1, plot3, plot4, plot5,ncol = 2, nrow = 2, labels = c("Plot 1","Plot 2","Plot 3","Plot 4"),
+          font.label = list(size = 10, color = "blue"), vjust = .90,hjust = -.25)
+
+annotate_figure(figure,
+               top = text_grob("Motorcycle Accident Variables", color = "black", face = "bold", size = 10),
+               bottom = text_grob("Data source: Minister of Transportion", color = "black",
+                                  hjust = 1, x = 1, face = "italic", size = 7),
+               fig.lab = "Figure 3", fig.lab.face = "bold"
+)
+
+```
+
+Plots 1 and 2 in Figure 3 confirmed that a Poisson distribution was suitable for this data. Plot 1 is showing a right skew with a large quantity of zeros, the skew of this data does not appear to be as visually significant as the car accident dataset used in Objective 1. Plot 2 has a curvature in hour of the day, which again was unsurprising due to working hours, and could be examined further with hypothesis tests on hour in future work. Again, the option of using a squared value would not be appealing since the variable is distinct as I noted earlier.
+
+I hypothesized that there was no difference between motorcycle accidents with injuries during the weekdays versus the weekends. The alternative hypothesis is that there was a difference between these motorcycle accidents on weekdays versus weekends. The zero inflated model was used again as part of the initial analysis with a response of frequency and two explanatory variables one being weekday versus weekend (DOWType) and the other being hour (Hour). I did not include time of day (TOD) and day of week (DOW) initially due to the fact that time of day and day of week already had some interaction with the main variable in question (DOWType) and would make inference more difficult. The options from the explanatory analysis at this point would be to drop the hour variable and use a simple model of just DOWType. I proceeded with the full model including hour and decided to test it later versus a simpler model using ANOVA.
+ 
+
+*Hypothesis*: 
+
+$H_0$ : $\mu$ motorcycle accidents on weekdays = $\mu$ motorcycle accidents on weekends
+              
+$H_A$ : $\mu$ motorcycle accidents on weekdays $\neq$ $\mu$ motorcycle accidents on weekends
+
+
+$Y_i \overset{ind}{\sim} ZIP(\pi_i, \lambda_i)$
+
+
+  $logit(\pi_i) = \beta_0+ \beta_1 X_{DOWType} + \beta_2 X_{Hour}$
+
+and 
+
+  $log(\lambda_i) = \gamma_0 + \gamma_1 X_{DOWType} + \gamma_2 X_{Hour}$
+  
+with $\beta$ representing the coefficients for the count (logit) function, $\gamma$ representing the coefficients of the Poisson (log) function. $X_1$ is 0 if weekday and 1 if weekend, and $X_2$ is the numerical indicator for hour. 
+
+
+
+
+```{r echo= FALSE, results='hide'}
+
+model1 <- zeroinfl(Freq ~ DOWType + Hour, data = objTwo, 
+	dist = "poisson")
+summary(model1)
+
+```
+
+After running the zero-inflated Poisson model, I noticed that the DOWType p-value was not significant at the $\alpha$ = 0.05 level for either the logit() or log() parts of the model (p-values = 0.0527 and 0.254 respectively). The only coefficient significant in both models was the Hour variable, with a p-value < 0.0002 in both parts. Before I could make inference or look deeply into this summary, an evaluation of model fit was needed. I first tested the zero-inflated model assigned to model1 vs the negative binomial model assigned to model2.
+
+
+###Statistical Modeling
+
+```{r echo= FALSE, results='hide'}
+
+model2 <- glm.nb(Freq ~ DOWType + Hour, data = objTwo)
+
+vuong(model2, model1)
+
+
+```
+
+
+
+```{r echo= FALSE, results='hide'}
+
+#mod4 <- glm.nb(Freq ~ DOWType + TOD , data = objTwo)
+
+model4 <- glm.nb(Freq ~ DOWType , data = objTwo)
+
+anova(model4, model2, test="Chisq")
+
+LRstats(model4, model2)
+
+#vuong(model2, model4)
+
+```
+
+With un-nested models I returned to the Vuong test to compare the two model fits. The negative binomial model was the better fit with a p-value < 0.002, and a z-statistics of 6.123780 for the `AIC` score. I used the `AIC` score knowing that since I believed that zero-inflation does exist in the model and understanding that if zero-inflation does exist the `AIC` and `BIC` would be approximately equivalent and therefore I arbitrarily selected one.
+
+I performed two more diagnostic tests to check model fit before attempting to make inference. Model2, the negative binomial model, was now my model of choice moving forward. I revisited the thought of a simpler model $(Freq = intercept + X_{DOWType})$ versus a saturated model $(Freq = intercept + X_{DOWType }+ X_{Hour})$. I used a drop in deviance test, with both the ANOVA function and the Likelihood summary table (LRstats function) to check and verify model fit. The ANOVA test with 1 degree of freedom gave strong evidence to support the use of the full model versus that of the simpler model with a p-value=4.074e-09. Using the information criterion for the model comparison (LRstats), resulted in a slightly lower `AIC` score of the simpler model over the full model with 1046.8 versus 1014.2 respectively. However, the `BIC` puts a larger penalty on models and would normally lean towards a simpler model, but the `BIC` results supported the full model, contradicting the `AIC` score. Something else that drew my attention was that the p-values for both models were not significant at the level of $\alpha$=0.05 with both p-values > 0.05.
+
+The last check was to look at the residuals of the model fit. Based on the `BIC`, and ANOVA I still proceeded forward with a negative binomial model (model2). The results are shown in Figure 4 below:
+
+
+```{r echo = FALSE, message = FALSE, warning = FALSE, print = FALSE}
+
+objTwo$residuals_deviance <- residuals(model2)
+objTwo$residuals_pearson <- residuals(model2, type = "pearson")
+r <- ggplot(data = objOne, aes(Hour,residuals_deviance)) + geom_point() + ggtitle("Deviance Residual")+
+  theme(plot.title = element_text(hjust = 0.5))
+r1 <- ggplot(data = objOne, aes(Hour,residuals_pearson)) + geom_point() + ggtitle("Pearson Residual")+
+  theme(plot.title = element_text(hjust = 0.5))
+r2 <- ggplot(data = objOne, aes(residuals_deviance,residuals_pearson)) + geom_point() +ggtitle("Deviance vs Pearson")+ theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r echo = FALSE}
+figure <- ggarrange(r, r1, r2,ncol = 2, nrow = 2, labels = c("Plot 1","Plot 2","Plot 3"),
+          font.label = list(size = 10, color = "blue"), vjust = .90,hjust = -.25)
+
+annotate_figure(figure,
+               top = text_grob("Model Fit Residual Evaluation", color = "black", face = "bold", size = 14),
+               fig.lab = "Figure 4", fig.lab.face = "bold"
+)
+
+```
+
+Looking at Plot 1 and Plot 2 the residuals appeared to have a slight cyclic pattern, but it did not look too concerning. There were also two outliers in all three plots which might require a leverage test. When looking at the Deviance residuals versus the Pearson residuals (Plot 3) the line is not as straight as I would have hoped. Since I had a slight concern on residuals, I checked the probability of experiencing a residual deviance of 192.80 with 165 degrees of freedom in a $\chi^2$  table (goodness of fit test). The result indicated that the negative binomial model with explanatory variables of DOWType and Hour was not a good model fit with a p-value= 0.0683514 at the $\alpha$ = 0.05 level. With that information, I could not make inference. Below is the summary output.
+
+```{r echo=FALSE}
+summary(model2)
+```
+
+```{r echo= FALSE, results='hide'}
+
+pchisq(192.80,165, lower.tail = FALSE)
+
+
+```
+
+###Results Summary for Objective 2
+
+The results of the model fits indicated that inference could not be made, and that a new hypothesis test would need to be conducted.
+
+I did perform an exploratory analysis afterwards, which could not be used for inference on the population since I had performed data snooping. During the analysis I found that a negative binomial model with weekend vs weekday plus an interaction term of time of day and day of week was an appropriate model. The residuals were more evenly spread out with no clear pattern in their distribution. The Likelihood Ratio test also gave support of this model over that of the model2 with a `BIC` and `AIC` score almost 200 points lower than the previous models (lower the score the more suitable the model). I than checked the p-value of finding residual deviance of 192.38 on 160 degrees of freedom for this model and found that at the $\alpha$=0.05 level this model had a p-value=0.04116 which supports the evidence that this model was an OK fit. After converting everything back to scale the coefficient for DOWType was 1.842089, meaning that weekends had a higher impact on accidents for motorcycles with a confidence region of 0.871255 to 3.8947 being the lower and upper bounds. The p-value of the DOWType was 0.1097 and would support that there was not sufficient evidence to reject the null hypothesis that there is a difference between motorcycle accidents on the weekend vs the weekday if all other variables were held constant. Below is the residuals in Figure 5 and below that is the summary output of the new model:
+
+
+
+```{r echo= FALSE, results='hide'}
+
+model7 <- glm.nb(Freq ~ DOWType  + TOD*DOW, data = objTwo)
+
+```
+
+
+```{r echo= FALSE, results='hide'}
+
+LRstats(model2, model7)
+
+
+```
+
+
+```{r echo = FALSE, message = FALSE, warning = FALSE, print = FALSE}
+
+objTwo$residuals_deviance <- residuals(model7)
+objTwo$residuals_pearson <- residuals(model7, type = "pearson")
+r <- ggplot(data = objOne, aes(Hour,residuals_deviance)) + geom_point() + ggtitle("Deviance Residual")+
+  theme(plot.title = element_text(hjust = 0.5))
+r1 <- ggplot(data = objOne, aes(Hour,residuals_pearson)) + geom_point() + ggtitle("Pearson Residual")+
+  theme(plot.title = element_text(hjust = 0.5))
+r2 <- ggplot(data = objOne, aes(residuals_deviance,residuals_pearson)) + geom_point() +ggtitle("Deviance vs Pearson")+ theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r echo = FALSE}
+figure <- ggarrange(r, r1, r2,ncol = 2, nrow = 2, labels = c("Plot 1","Plot 2","Plot 3"),
+          font.label = list(size = 10, color = "blue"), vjust = .90,hjust = -.25)
+
+annotate_figure(figure,
+               top = text_grob("Model Fit Residual Evaluation", color = "black", face = "bold", size = 14),
+               fig.lab = "Figure 5", fig.lab.face = "bold"
+)
+
+```
+
+```{r echo=FALSE}
+summary(model7)
+```
+
+
+```{r echo= FALSE, results='hide'}
+
+pchisq(192.38,160, lower.tail = FALSE)
+
+
+```
+
+
+
+```{r echo = FALSE, message = FALSE, warning = FALSE, print = FALSE, results='hide'}
+
+exp(0.6109)
+exp(0.6109 + c(-1,1)*1.96*0.3820)
+```
+
+###Conclusion
+
+The analysis for Objective 1 showed strong evidence to support that there is a difference between car accidents with injuries versus car accidents with fatalities on the roads of New Zealand in 2009. During that same timeframe, analysis Objective 2 showed that there was not sufficient evidence to support a difference in motorcycle accidents between weekdays and weekends in New Zealand. Overall, this analysis has some limitations and would need to be used with caution. The first objective resulted in a model that had a high ?? value and a high Mean Square Prediction Error value. With so much overdispersion it is possible that another model such as a mixed model could be more suitable. Also, the interaction term in the model would need to be taken into deep consideration when trying to make inference on the coefficients. The analysis for Objective 2 had limitations in inference. One limitation was that the actual inference is based on a biased model. The second limitation was that other models were not a suitable fit, even though they supported a similar conclusion. There are several possibilities for further analysis from this information. First, that a new hypothesis and model could be used to make inference on the second objective. Second, further information could be gathered to see if these conclusions align with other years. Third, the data could be unaggregated to see if the same conclusions are met and that this is not a matter of Simpsons paradox. The most interesting future work that I would mention is that during the analysis, hour seemed to be a rather important variable and could lead to numerous analysis possibilities in regards to conducting hypothesis tests around that and how it could be used to help keep the roads in New Zealand safer.
+
+
+###Appendix
+
+```{r ref.label=knitr::all_labels(), echo = T, eval = F}
+```
