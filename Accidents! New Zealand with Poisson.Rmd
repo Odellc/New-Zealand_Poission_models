@@ -1,6 +1,5 @@
 ---
 title: "Accident! Analysis of New Zealand accident data with Poisson models"
-#subtitle: "ST_518 OSU"
 author: "Christopher Odell"
 output:
   word_document: default
@@ -47,8 +46,6 @@ The data was collected by the New Zealand Ministry of Transport and was reported
 
 From there I subsetted the data into two data frames, one being car accidents and the other being motorcycle accidents. Within the car accident dataframe I added a column to classify car accidents with fatalities versus car accidents with only injuries as a binary (1,0) variable. In the motorcycle dataframe, I performed a similar addition to classify motorcycle accidents with injuries on weekdays versus weekends into a binary (1,0) variable.
  
-
-
 
 
 ```{r, echo = FALSE, message = FALSE, warning = FALSE, print = FALSE, results='hide'}
